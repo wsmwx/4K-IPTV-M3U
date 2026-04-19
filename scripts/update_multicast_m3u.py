@@ -386,26 +386,43 @@ def process_region(
     except Exception:
         pass
 
-    tr_list = page.locator("table.hotel-iptv-table tbody tr")
-    n = tr_list.count()
     target_idx = -1
-    for i in range(n):
-        tr = tr_list.nth(i)
-        tds = tr.locator("td")
-        if tds.count() < 6:
-            continue
-        status = tds.nth(5).inner_text().strip()
-        typ = tds.nth(2).inner_text().strip()
-        if region_zh not in typ:
-            continue
-        # 仅选“新上线”状态（按用户要求）
-        if "新上线" in status:
-            target_idx = i
+    target_page = 1
+    for page_no in range(1, max(1, args.max_region_pages) + 1):
+        tr_list = page.locator("table.hotel-iptv-table tbody tr")
+        n = tr_list.count()
+        for i in range(n):
+            tr = tr_list.nth(i)
+            tds = tr.locator("td")
+            if tds.count() < 6:
+                continue
+            status = tds.nth(5).inner_text().strip()
+            typ = tds.nth(2).inner_text().strip()
+            if region_zh not in typ:
+                continue
+            # 仅选“新上线”状态（按用户要求）
+            if "新上线" in status:
+                target_idx = i
+                target_page = page_no
+                break
+        if target_idx >= 0:
             break
+        # 翻到下一页继续找“新上线”
+        if page_no < args.max_region_pages:
+            pager = page.locator(f'a.page-link[data-page="{page_no + 1}"]')
+            if pager.count() == 0:
+                break
+            try:
+                pager.first.click(timeout=4000)
+                page.wait_for_timeout(600)
+            except Exception:
+                break
+
     if target_idx < 0:
         print(f"[skip] {region_zh}: no multicast rows", file=sys.stderr)
         return None
-
+    print(f"[info] {region_zh}: found 新上线 on page {target_page}", file=sys.stderr)
+    tr_list = page.locator("table.hotel-iptv-table tbody tr")
     tr = tr_list.nth(target_idx)
     token = (tr.locator("a.ip-link").first.get_attribute("data-p") or "").strip()
     if not token:
@@ -498,6 +515,7 @@ def main() -> int:
     ap.add_argument("--test-top-n", type=int, default=8, help="How many m3u8 URLs to probe")
     ap.add_argument("--regions", default="", help="Comma province codes, e.g. hb,sc (default: all)")
     ap.add_argument("--stop-on-consecutive-fail", type=int, default=4)
+    ap.add_argument("--max-region-pages", type=int, default=4, help="Max pages to scan per region for 新上线 rows")
     ap.add_argument(
         "--include-overseas",
         action="store_true",
