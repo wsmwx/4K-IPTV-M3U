@@ -167,6 +167,38 @@ def _parse_plain_channel_lines(text: str) -> list[tuple[str, str]]:
     return out
 
 
+def _extract_pairs_from_page_text(page) -> list[tuple[str, str]]:
+    """Read textarea/body text and parse loose channel,url lines."""
+    buf: list[str] = []
+    try:
+        tas = page.locator("textarea")
+        for i in range(tas.count()):
+            try:
+                v = tas.nth(i).input_value(timeout=500)
+                if v:
+                    buf.append(v)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        body_txt = page.locator("body").inner_text(timeout=1200)
+        if body_txt:
+            buf.append(body_txt)
+    except Exception:
+        pass
+
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for chunk in buf:
+        for name, url in _parse_plain_channel_lines(chunk):
+            if url in seen:
+                continue
+            seen.add(url)
+            pairs.append((name, url))
+    return pairs
+
+
 def _rewrite_m3u(region_zh: str, pairs: Iterable[tuple[str, str]]) -> str:
     lines = ["#EXTM3U"]
     for name, url in pairs:
@@ -397,7 +429,7 @@ def process_region(
         except Exception:
             continue
 
-    m3u_url = _find_m3u_download_url(html, BASE)
+    m3u_url = _find_m3u_download_url(html, page.url)
     pairs: list[tuple[str, str]] | None = None
 
     # 优先点“M3U下载”拿真实文件，避免页面不直接暴露 m3u8 链接
@@ -429,13 +461,18 @@ def process_region(
             pairs = None
 
     if not pairs:
+        txt_pairs = _extract_pairs_from_page_text(page)
+        if txt_pairs:
+            pairs = txt_pairs
+
+    if not pairs:
         # 取消 m3u8 可播校验：频道列表里有链接就直接落盘
-        anchor_pairs = _extract_channel_pairs_from_html(html, BASE)
+        anchor_pairs = _extract_channel_pairs_from_html(html, page.url)
         if anchor_pairs:
             pairs = anchor_pairs
 
     if not pairs:
-        m3u8s = _collect_m3u8_hrefs(html, BASE)
+        m3u8s = _collect_m3u8_hrefs(html, page.url)
         if m3u8s:
             u = m3u8s[0]
         else:
