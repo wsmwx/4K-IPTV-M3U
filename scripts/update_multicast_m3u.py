@@ -168,6 +168,23 @@ def _parse_plain_channel_lines(text: str) -> list[tuple[str, str]]:
     return out
 
 
+def _extract_m3u_urls_from_text(text: str, base_url: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"https?://[^\s\"'<>]+\.m3u(?:8)?[^\s\"'<>]*", text, flags=re.I):
+        u = m.group(0).replace("&amp;", "&")
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    for m in re.finditer(r'href\s*=\s*"([^"]+\.m3u(?:8)?[^"]*)"', text, flags=re.I):
+        h = m.group(1).replace("&amp;", "&")
+        u = h if h.startswith("http") else urljoin(base_url, h)
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
 def _extract_pairs_from_page_text(page) -> list[tuple[str, str]]:
     """Read textarea/body text and parse loose channel,url lines."""
     buf: list[str] = []
@@ -447,7 +464,27 @@ def process_region(
         page.wait_for_timeout(900)
         html = page.content()
 
-    # 查看频道列表（blog 为同页 Ajax 切换）
+    # 捕获点击后的网络响应（有些页面把频道数据放在 XHR，不直接渲染到 DOM）
+    net_payloads: list[str] = []
+
+    def _on_response(resp):
+        try:
+            u = resp.url.lower()
+            if (
+                "admin-ajax.php" in u
+                or "iptv.cqshushu.com/index.php" in u
+                or ".m3u" in u
+                or ".m3u8" in u
+            ):
+                txt = resp.text()
+                if txt and ("m3u" in txt.lower() or "http" in txt.lower()):
+                    net_payloads.append(txt)
+        except Exception:
+            pass
+
+    page.on("response", _on_response)
+
+    # 查看频道列表
     for name in ("查看频道列表", "频道列表"):
         loc = page.get_by_text(name, exact=False)
         if loc.count() == 0:
@@ -459,6 +496,8 @@ def process_region(
             break
         except Exception:
             continue
+    page.wait_for_timeout(500)
+    page.remove_listener("response", _on_response)
 
     m3u_url = _find_m3u_download_url(html, page.url)
     pairs: list[tuple[str, str]] | None = None
@@ -495,6 +534,22 @@ def process_region(
         txt_pairs = _extract_pairs_from_page_text(page)
         if txt_pairs:
             pairs = txt_pairs
+
+    if not pairs and net_payloads:
+        # 先尝试把接口返回当作 M3U / 文本频道列表解析
+        for payload in net_payloads:
+            pairs = _parse_m3u_text(payload) or _parse_plain_channel_lines(payload)
+            if pairs:
+                break
+        # 再兜底从接口返回里抽 URL
+        if not pairs:
+            all_urls: list[str] = []
+            for payload in net_payloads:
+                all_urls.extend(_extract_m3u_urls_from_text(payload, page.url))
+            if all_urls:
+                first = all_urls[0]
+                nm = urlparse(first).path.split("/")[-1].split("?")[0] or "live"
+                pairs = [(nm.replace(".m3u8", "").replace(".m3u", "") or "live", first)]
 
     if not pairs:
         # 取消 m3u8 可播校验：频道列表里有链接就直接落盘
