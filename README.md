@@ -11,15 +11,13 @@
 
 该仓库使用 `rtp/b.py` 按省份模板自动搜集可用 `udpxy` 节点，并生成：
 
-- `rtp/*.txt`
-- `rtp/*.m3u`
+- `txt/*.txt`
+- `m3u/*.m3u`
 
 ## 本地运行
 
 1. 安装依赖：
    - `pip install -r requirements.txt`
-2. 设置环境变量：
-   - `QUAKE_TOKEN=<你的 Quake Token>`
 3. 运行：
    - `python rtp/b.py`
 
@@ -27,17 +25,16 @@
 
 - `python rtp/b.py --push`
 
-## GitHub 定时更新（每 3 天）
+## GitHub 定时更新（每 3 天一次组播IP，一天2次更新udpxy服务器）
 
 工作流文件：`.github/workflows/update-rtp.yml`
+           `.github/workflows/update-rtp-groups.yml`
 
 - 定时表达式：`0 2 */3 * *`
 - 触发方式：手动触发 + 定时触发
 
 ### 必要配置
 
-在仓库 `Settings -> Secrets and variables -> Actions` 中新增：
 
-- `QUAKE_TOKEN`：你的 Quake API Token
 
-配置完成后，工作流会每 3 天自动执行脚本并提交变更到当前仓库。
+配置完成后，（每 3 天一次组播IP，一天2次更新udpxy服务器）
