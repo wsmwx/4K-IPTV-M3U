@@ -14,6 +14,8 @@ TEMPLATE_DIR = "rtp"                                  # 母版文件夹名称
 # 提交说明前缀；为空时使用默认文案
 GITHUB_COMMIT_PREFIX = "Auto update"
 # ============================================
+EPG_URL = "http://epg.51zmt.top:8000/e.xml.gz"
+TVG_LOGO_URL = "https://gcore.jsdelivr.net/gh/taksssss/tv/icon/.png"
 
 # 中国省份全称及简称对照表，用于智能嗅探
 PROVINCES = ["北京", "天津", "河北", "山西", "内蒙古", "辽宁", "吉林", "黑龙江", "上海", 
@@ -95,28 +97,30 @@ def get_quake_assets(province):
     except Exception: pass
     return []
 
-def txt_to_m3u_format(txt_content):
+def txt_to_m3u_format(txt_content, group_title):
     """智能转换 M3U 分组格式"""
     m3u_lines = []
-    current_group = "未分类"
     for line in txt_content.splitlines():
         line = line.strip()
         if not line: continue
         if '#genre#' in line:
-            current_group = line.split(',')[0].strip()
+            continue
         elif ',' in line:
             name, url = [p.strip() for p in line.split(',', 1)]
-            m3u_lines.append(f'#EXTINF:-1 group-title="{current_group}",{name}\n{url}')
+            m3u_lines.append(
+                f'#EXTINF:-1 tvg-id="{name}" tvg-logo="{TVG_LOGO_URL}" group-title="{group_title}",{name}\n{url}'
+            )
     return "\n".join(m3u_lines)
 
-def process_province(template_filename):
+def process_province(template_filename, template_dir, txt_output_dir, m3u_output_dir):
     """单一省份核心流水线"""
     province = extract_province(template_filename)
     if not province: return
 
-    template_path = os.path.join(TEMPLATE_DIR, template_filename)
-    out_txt = template_filename 
-    out_m3u = template_filename.replace('.txt', '.m3u')
+    template_path = os.path.join(template_dir, template_filename)
+    out_txt = os.path.join(txt_output_dir, template_filename)
+    out_m3u = os.path.join(m3u_output_dir, template_filename.replace('.txt', '.m3u'))
+    group_title = os.path.splitext(template_filename)[0]
 
     # 1. 检测已有文件
     if check_and_clear_existing(out_txt, out_m3u): return
@@ -159,11 +163,11 @@ def process_province(template_filename):
     if valid_hosts:
         pattern = re.compile(r'(?:https?://[^/,]+/)?(udp|rtp|igmp)(?:/|://)(\d+\.\d+\.\d+\.\d+:\d+)', re.IGNORECASE)
         with open(out_txt, 'w', encoding='utf-8') as f_txt, open(out_m3u, 'w', encoding='utf-8') as f_m3u:
-            f_m3u.write("#EXTM3U\n")
+            f_m3u.write(f'#EXTM3U x-tvg-url="{EPG_URL}"\n')
             for host in valid_hosts:
                 new_txt_block = pattern.sub(f'http://{host}/\\1/\\2', template_content)
                 f_txt.write(new_txt_block + "\n\n")
-                f_m3u.write(txt_to_m3u_format(new_txt_block) + "\n\n")
+                f_m3u.write(txt_to_m3u_format(new_txt_block, group_title) + "\n\n")
         print(f"[+] 完美！[{province}] 更新完成，获取 {len(valid_hosts)} 个纯净节点。")
     else:
         print(f"[-] [{province}] 本次搜索全军覆没，明天再试。")
@@ -236,16 +240,23 @@ def parse_args():
 
 def main():
     args = parse_args()
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    
-    if not os.path.exists(TEMPLATE_DIR):
-        os.makedirs(TEMPLATE_DIR)
-        print(f"[!] 没有找到 '{TEMPLATE_DIR}' 目录，已自动创建。请放入模板后重新运行！")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(script_dir)
+    template_dir = os.path.join(script_dir, TEMPLATE_DIR)
+    txt_output_dir = os.path.join(repo_root, "txt")
+    m3u_output_dir = os.path.join(repo_root, "m3u")
+
+    if not os.path.exists(template_dir):
+        os.makedirs(template_dir)
+        print(f"[!] 没有找到 '{template_dir}' 目录，已自动创建。请放入模板后重新运行！")
         return
 
-    template_files = [f for f in os.listdir(TEMPLATE_DIR) if f.endswith('.txt')]
+    os.makedirs(txt_output_dir, exist_ok=True)
+    os.makedirs(m3u_output_dir, exist_ok=True)
+
+    template_files = [f for f in os.listdir(template_dir) if f.endswith('.txt')]
     if not template_files:
-        print(f"[!] '{TEMPLATE_DIR}' 目录中空空如也，请放入各省市的模板文件。")
+        print(f"[!] '{template_dir}' 目录中空空如也，请放入各省市的模板文件。")
         return
 
     # 流水线处理各省份
@@ -253,9 +264,15 @@ def main():
         print(f"\n" + "="*50)
         print(f" 正在处理兵工厂任务: {filename}")
         print("="*50)
-        process_province(filename)
+        process_province(filename, template_dir, txt_output_dir, m3u_output_dir)
     
-    generated_files = [f for f in os.listdir('.') if f.endswith('.txt') or f.endswith('.m3u')]
+    generated_files = []
+    generated_files.extend(
+        [os.path.join("txt", f) for f in os.listdir(txt_output_dir) if f.endswith('.txt')]
+    )
+    generated_files.extend(
+        [os.path.join("m3u", f) for f in os.listdir(m3u_output_dir) if f.endswith('.m3u')]
+    )
     if args.push:
         print("\n[] 流水线本地文件生成完毕，准备执行 GitHub 同步...")
         push_to_github(generated_files)
