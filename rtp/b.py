@@ -13,7 +13,6 @@ from Crypto.Util.Padding import pad
 
 # ================= 配置区域 =================
 # 1. 组播源网站配置
-TEMPLATE_DIR = "rtp"                                  # 母版文件夹名称
 MULTICAST_SOURCE_URL = "https://blog.cqshushu.com/multicast-iptv"
 
 # 2. GitHub 推送配置
@@ -39,12 +38,6 @@ def get_root_domain(domain):
             return ".".join(parts[-3:])
         else: return ".".join(parts[-2:])
     return domain
-
-def extract_province(filename):
-    """智能识别省份"""
-    for p in PROVINCES:
-        if p in filename: return p
-    return None
 
 def check_and_clear_existing(txt_file, m3u_file):
     """不做测流，直接清空旧文件并重新导出。"""
@@ -213,7 +206,7 @@ def parse_channel_lines(channels_html: str) -> list[str]:
 def fetch_channel_lines_by_province(province: str):
     rows = fetch_region_rows_by_ajax(province, limit=20)
     if not rows:
-        return [], "list_empty"
+        return [], "list_empty", province
     picked = None
     for row in rows:
         if "新上线" in row.get("status", ""):
@@ -225,7 +218,7 @@ def fetch_channel_lines_by_province(province: str):
                 picked = row
                 break
     if not picked:
-        return [], "no_new_or_alive"
+        return [], "no_new_or_alive", province
 
     session = requests.Session()
     session.headers.update(
@@ -241,7 +234,7 @@ def fetch_channel_lines_by_province(province: str):
     home_resp.raise_for_status()
     ajax_cfg = _extract_ajax_config(home_resp.text)
     if not ajax_cfg:
-        return [], "ajax_cfg_missing"
+        return [], "ajax_cfg_missing", province
     token_plain = ajax_cfg.get("token", "")
 
     detail_payload = {
@@ -256,12 +249,12 @@ def fetch_channel_lines_by_province(province: str):
     detail_json = detail_resp.json()
     detail_html = detail_json.get("data", {}).get("html", "")
     if not detail_html:
-        return [], "detail_empty"
+        return [], "detail_empty", province
     token_plain = detail_json.get("data", {}).get("new_token", token_plain)
 
     s_token = parse_s_token(detail_html)
     if not s_token:
-        return [], "s_token_missing"
+        return [], "s_token_missing", province
 
     channels_payload = {
         "action": "multicast_iptv_ajax",
@@ -275,12 +268,12 @@ def fetch_channel_lines_by_province(province: str):
     channels_json = channels_resp.json()
     channels_html = channels_json.get("data", {}).get("html", "")
     if not channels_html:
-        return [], "channels_empty"
+        return [], "channels_empty", province
 
     lines = parse_channel_lines(channels_html)
     if not lines:
-        return [], "channel_lines_empty"
-    return lines, "ok"
+        return [], "channel_lines_empty", province
+    return lines, "ok", picked.get("type", province)
 
 
 def extract_test_targets(template_content, max_targets=5):
@@ -322,23 +315,23 @@ def txt_to_m3u_format(txt_content, group_title):
             )
     return "\n".join(m3u_lines)
 
-def process_province(template_filename, template_dir, txt_output_dir, m3u_output_dir, source_rows=None):
+def process_province(province, txt_output_dir, m3u_output_dir):
     """单一省份核心流水线"""
-    province = extract_province(template_filename)
-    if not province: return
-
-    out_txt = os.path.join(txt_output_dir, template_filename)
-    out_m3u = os.path.join(m3u_output_dir, template_filename.replace('.txt', '.m3u'))
-    group_title = os.path.splitext(template_filename)[0]
+    group_title = province
+    out_txt = os.path.join(txt_output_dir, f"{group_title}.txt")
+    out_m3u = os.path.join(m3u_output_dir, f"{group_title}.m3u")
 
     # 1. 检测已有文件
     if check_and_clear_existing(out_txt, out_m3u): return
 
     # 2. 直接从频道列表提取 频道名+播放地址
-    channel_lines, status = fetch_channel_lines_by_province(province)
+    channel_lines, status, fetched_group_title = fetch_channel_lines_by_province(province)
     if not channel_lines:
         print(f"[-] [{province}] 频道提取失败: {status}")
         return
+    group_title = fetched_group_title or province
+    out_txt = os.path.join(txt_output_dir, f"{group_title}.txt")
+    out_m3u = os.path.join(m3u_output_dir, f"{group_title}.m3u")
     txt_content = "\n".join(channel_lines)
 
     # 3. 直接生成 txt/m3u（一步到位）
@@ -405,7 +398,7 @@ def push_to_github(files):
         print(f"[!] GitHub 同步异常: {e}")
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="RTP 模板搜源并生成省份 txt/m3u。")
+    ap = argparse.ArgumentParser(description="按省份抓取频道并生成 txt/m3u。")
     ap.add_argument(
         "--push",
         action="store_true",
@@ -419,7 +412,7 @@ def parse_args():
     ap.add_argument(
         "--only-province",
         default="",
-        help="仅处理文件名中包含该省份的模板。例如：--only-province 湖北",
+        help="仅处理指定省份。例如：--only-province 湖北",
     )
     return ap.parse_args()
 
@@ -428,38 +421,27 @@ def main():
     args = parse_args()
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.dirname(script_dir)
-    template_dir = os.path.join(script_dir, TEMPLATE_DIR)
     txt_output_dir = os.path.join(repo_root, "txt")
     m3u_output_dir = os.path.join(repo_root, "m3u")
 
     if args.test_region:
-        channel_lines, status = fetch_channel_lines_by_province(args.test_region)
-        print(f"\n[*] 测试结果: 地区={args.test_region}，状态={status}，频道数={len(channel_lines)}")
+        channel_lines, status, group_title = fetch_channel_lines_by_province(args.test_region)
+        print(f"\n[*] 测试结果: 地区={args.test_region}，分组={group_title}，状态={status}，频道数={len(channel_lines)}")
         for line in channel_lines[:10]:
             print(f"  - {line}")
-        return
-
-    if not os.path.exists(template_dir):
-        os.makedirs(template_dir)
-        print(f"[!] 没有找到 '{template_dir}' 目录，已自动创建。请放入模板后重新运行！")
         return
 
     os.makedirs(txt_output_dir, exist_ok=True)
     os.makedirs(m3u_output_dir, exist_ok=True)
 
-    template_files = [f for f in os.listdir(template_dir) if f.endswith('.txt')]
-    if not template_files:
-        print(f"[!] '{template_dir}' 目录中空空如也，请放入各省市的模板文件。")
-        return
-
     # 流水线处理各省份
-    for filename in template_files:
-        if args.only_province and args.only_province not in filename:
+    for province in PROVINCES:
+        if args.only_province and args.only_province not in province:
             continue
         print(f"\n" + "="*50)
-        print(f" 正在处理兵工厂任务: {filename}")
+        print(f" 正在处理地区任务: {province}")
         print("="*50)
-        process_province(filename, template_dir, txt_output_dir, m3u_output_dir)
+        process_province(province, txt_output_dir, m3u_output_dir)
 
     generated_files = []
     generated_files.extend(
