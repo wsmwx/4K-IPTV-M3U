@@ -354,13 +354,14 @@ def fetch_channel_lines_by_province(province: str, max_per_carrier: int = 3, max
         return [], "ajax_cfg_missing", province
     token_plain = ajax_cfg.get("token", "")
 
-    merged_lines = []
-    seen = set()
-    selected_ops = []
+    group_to_lines: dict[str, list[str]] = {}
+    group_to_seen: dict[str, set[str]] = {}
+    selected_ops: list[str] = []
 
     for picked in selected_rows:
         picked_type = picked.get("type", "")
-        selected_ops.append(normalize_group_title(picked_type, province))
+        group_title = normalize_group_title(picked_type, province)
+        selected_ops.append(group_title)
         detail_payload = {
             "action": "multicast_iptv_ajax",
             "action_type": "detail",
@@ -394,17 +395,22 @@ def fetch_channel_lines_by_province(province: str, max_per_carrier: int = 3, max
         if not channels_html:
             continue
         lines = parse_channel_lines(channels_html)
+        if not lines:
+            continue
+        bucket = group_to_lines.setdefault(group_title, [])
+        bucket_seen = group_to_seen.setdefault(group_title, set())
         for line in lines:
-            if line in seen:
+            if line in bucket_seen:
                 continue
-            seen.add(line)
-            merged_lines.append(line)
+            bucket_seen.add(line)
+            bucket.append(line)
 
-    if not merged_lines:
+    if not group_to_lines:
         return [], "channel_lines_empty", province
 
-    print(f"[*] [{province}] 已提取源数量: {len(selected_rows)}（电信/移动/联通各最多{max_per_carrier}条），来源: {', '.join(selected_ops)}")
-    return merged_lines, "ok", province
+    unique_ops = sorted(set(selected_ops))
+    print(f"[*] [{province}] 已提取源数量: {len(selected_rows)}（电信/移动/联通各最多{max_per_carrier}条），来源: {', '.join(unique_ops)}")
+    return group_to_lines, "ok", province
 
 
 def extract_test_targets(template_content, max_targets=5):
@@ -550,21 +556,30 @@ def process_province(province, txt_output_dir, m3u_output_dir, max_pages=30):
     if check_and_clear_existing(out_txt, out_m3u): return
 
     # 2. 直接从频道列表提取 频道名+播放地址
-    channel_lines, status, fetched_group_title = fetch_channel_lines_by_province(province, max_pages=max_pages)
-    if not channel_lines:
+    grouped_lines, status, _ = fetch_channel_lines_by_province(province, max_pages=max_pages)
+    if not grouped_lines:
         print(f"[-] [{province}] 频道提取失败: {status}")
         return
-    group_title = fetched_group_title or province
-    out_txt = os.path.join(txt_output_dir, f"{group_title}.txt")
-    out_m3u = os.path.join(m3u_output_dir, f"{group_title}.m3u")
-    txt_content = "\n".join(channel_lines)
 
-    # 3. 直接生成 txt/m3u（一步到位）
-    with open(out_txt, 'w', encoding='utf-8') as f_txt, open(out_m3u, 'w', encoding='utf-8') as f_m3u:
-        f_txt.write(txt_content + "\n")
-        f_m3u.write(f'#EXTM3U x-tvg-url="{EPG_URL}"\n')
-        f_m3u.write(txt_to_m3u_format(txt_content, group_title) + "\n")
-    print(f"[+] 完美！[{province}] 更新完成，导出 {len(channel_lines)} 条频道。")
+    # 3. 按运营商分组分别生成 txt/m3u（如：湖北电信、湖北联通、湖北移动）
+    total_channels = 0
+    exported = 0
+    for group_title, channel_lines in grouped_lines.items():
+        if not channel_lines:
+            continue
+        out_txt = os.path.join(txt_output_dir, f"{group_title}.txt")
+        out_m3u = os.path.join(m3u_output_dir, f"{group_title}.m3u")
+        txt_content = "\n".join(channel_lines)
+        with open(out_txt, 'w', encoding='utf-8') as f_txt, open(out_m3u, 'w', encoding='utf-8') as f_m3u:
+            f_txt.write(txt_content + "\n")
+            f_m3u.write(f'#EXTM3U x-tvg-url="{EPG_URL}"\n')
+            f_m3u.write(txt_to_m3u_format(txt_content, group_title) + "\n")
+        exported += 1
+        total_channels += len(channel_lines)
+    if exported == 0:
+        print(f"[-] [{province}] 频道提取失败: channel_lines_empty")
+        return
+    print(f"[+] 完美！[{province}] 更新完成，导出 {total_channels} 条频道，生成 {exported} 个运营商文件。")
 
 def push_to_github(files):
     """
@@ -656,13 +671,14 @@ def main():
     m3u_output_dir = os.path.join(repo_root, "m3u")
 
     if args.test_region:
-        channel_lines, status, group_title = fetch_channel_lines_by_province(
+        grouped_lines, status, group_title = fetch_channel_lines_by_province(
             args.test_region,
             max_pages=args.max_pages,
         )
-        print(f"\n[*] 测试结果: 地区={args.test_region}，分组={group_title}，状态={status}，频道数={len(channel_lines)}")
-        for line in channel_lines[:10]:
-            print(f"  - {line}")
+        total = sum(len(v) for v in grouped_lines.values()) if grouped_lines else 0
+        print(f"\n[*] 测试结果: 地区={args.test_region}，分组={group_title}，状态={status}，频道数={total}")
+        for k, v in grouped_lines.items():
+            print(f"  - {k}: {len(v)} 条")
         return
 
     os.makedirs(txt_output_dir, exist_ok=True)
