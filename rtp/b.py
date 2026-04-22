@@ -6,6 +6,7 @@ import subprocess
 import argparse
 import json
 import base64
+from datetime import datetime
 from html import unescape
 from urllib.parse import quote
 from Crypto.Cipher import AES
@@ -21,6 +22,9 @@ GITHUB_COMMIT_PREFIX = "Auto update"
 # ============================================
 EPG_URL = "http://epg.51zmt.top:8000/e.xml.gz"
 TVG_LOGO_BASE_URL = "https://gcore.jsdelivr.net/gh/taksssss/tv/icon/"
+README_FILE = "README.md"
+RAW_BASE_URL = "https://raw.githubusercontent.com/jia070310/4K-IPTV-M3U/main"
+PROXY_PREFIX = "https://gh-proxy.org/"
 
 # 中国省份全称及简称对照表，用于智能嗅探
 PROVINCES = ["北京", "天津", "河北", "山西", "内蒙古", "辽宁", "吉林", "黑龙江", "上海",
@@ -264,21 +268,50 @@ def parse_operator_name(detail_html: str, province: str) -> str:
             return f"{province}{carrier}"
     return province
 
-def fetch_channel_lines_by_province(province: str):
+def fetch_channel_lines_by_province(province: str, max_per_carrier: int = 3):
     rows = fetch_region_rows_by_ajax(province, limit=20)
     if not rows:
         return [], "list_empty", province
-    picked = None
-    for row in rows:
-        if "新上线" in row.get("status", ""):
-            picked = row
-            break
-    if not picked:
-        for row in rows:
-            if "存活" in row.get("status", ""):
-                picked = row
+
+    def _is_usable_status(status: str) -> bool:
+        return ("新上线" in status) or ("存活" in status)
+
+    def _pick_many(rows_pool, carrier: str, limit: int):
+        carrier_rows = [r for r in rows_pool if carrier in r.get("type", "") and _is_usable_status(r.get("status", ""))]
+        if not carrier_rows or limit <= 0:
+            return []
+        new_rows = [r for r in carrier_rows if "新上线" in r.get("status", "")]
+        alive_rows = [r for r in carrier_rows if "存活" in r.get("status", "")]
+        picked = []
+        seen = set()
+        for row in (new_rows + alive_rows):
+            token = row.get("p_token")
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            picked.append(row)
+            if len(picked) >= limit:
                 break
-    if not picked:
+        return picked
+
+    selected_rows = []
+    selected_tokens = set()
+    for carrier in ("电信", "移动", "联通"):
+        for row in _pick_many(rows, carrier, max_per_carrier):
+            token = row.get("p_token")
+            if not token or token in selected_tokens:
+                continue
+            selected_rows.append(row)
+            selected_tokens.add(token)
+
+    # 兜底：三网都没有可用源时，至少保留1条“新上线/存活”
+    if not selected_rows:
+        for row in rows:
+            if _is_usable_status(row.get("status", "")):
+                selected_rows = [row]
+                break
+
+    if not selected_rows:
         return [], "no_new_or_alive", province
 
     session = requests.Session()
@@ -298,45 +331,57 @@ def fetch_channel_lines_by_province(province: str):
         return [], "ajax_cfg_missing", province
     token_plain = ajax_cfg.get("token", "")
 
-    detail_payload = {
-        "action": "multicast_iptv_ajax",
-        "action_type": "detail",
-        "p": picked.get("p_token", ""),
-        "nonce": ajax_cfg.get("nonce", ""),
-        "token": _encrypt_token(token_plain),
-    }
-    detail_resp = session.post(ajax_cfg.get("ajaxUrl", ""), data=detail_payload, timeout=15)
-    detail_resp.raise_for_status()
-    detail_json = detail_resp.json()
-    detail_html = detail_json.get("data", {}).get("html", "")
-    if not detail_html:
-        return [], "detail_empty", province
-    token_plain = detail_json.get("data", {}).get("new_token", token_plain)
+    merged_lines = []
+    seen = set()
+    selected_ops = []
 
-    s_token = parse_s_token(detail_html)
-    if not s_token:
-        return [], "s_token_missing", province
+    for picked in selected_rows:
+        picked_type = picked.get("type", "")
+        selected_ops.append(normalize_group_title(picked_type, province))
+        detail_payload = {
+            "action": "multicast_iptv_ajax",
+            "action_type": "detail",
+            "p": picked.get("p_token", ""),
+            "nonce": ajax_cfg.get("nonce", ""),
+            "token": _encrypt_token(token_plain),
+        }
+        detail_resp = session.post(ajax_cfg.get("ajaxUrl", ""), data=detail_payload, timeout=15)
+        detail_resp.raise_for_status()
+        detail_json = detail_resp.json()
+        detail_html = detail_json.get("data", {}).get("html", "")
+        if not detail_html:
+            continue
+        token_plain = detail_json.get("data", {}).get("new_token", token_plain)
 
-    channels_payload = {
-        "action": "multicast_iptv_ajax",
-        "action_type": "channels",
-        "s": s_token,
-        "nonce": ajax_cfg.get("nonce", ""),
-        "token": _encrypt_token(token_plain),
-    }
-    channels_resp = session.post(ajax_cfg.get("ajaxUrl", ""), data=channels_payload, timeout=15)
-    channels_resp.raise_for_status()
-    channels_json = channels_resp.json()
-    channels_html = channels_json.get("data", {}).get("html", "")
-    if not channels_html:
-        return [], "channels_empty", province
+        s_token = parse_s_token(detail_html)
+        if not s_token:
+            continue
 
-    lines = parse_channel_lines(channels_html)
-    if not lines:
+        channels_payload = {
+            "action": "multicast_iptv_ajax",
+            "action_type": "channels",
+            "s": s_token,
+            "nonce": ajax_cfg.get("nonce", ""),
+            "token": _encrypt_token(token_plain),
+        }
+        channels_resp = session.post(ajax_cfg.get("ajaxUrl", ""), data=channels_payload, timeout=15)
+        channels_resp.raise_for_status()
+        channels_json = channels_resp.json()
+        channels_html = channels_json.get("data", {}).get("html", "")
+        if not channels_html:
+            continue
+        lines = parse_channel_lines(channels_html)
+        for line in lines:
+            if line in seen:
+                continue
+            seen.add(line)
+            merged_lines.append(line)
+
+    if not merged_lines:
         return [], "channel_lines_empty", province
-    operator_name = parse_operator_name(detail_html, province)
-    group_title = operator_name or normalize_group_title(picked.get("type", province), province)
-    return lines, "ok", group_title
+
+    print(f"[*] [{province}] 已提取源数量: {len(selected_rows)}（电信/移动/联通各最多{max_per_carrier}条），来源: {', '.join(selected_ops)}")
+    return merged_lines, "ok", province
 
 
 def extract_test_targets(template_content, max_targets=5):
@@ -377,6 +422,92 @@ def txt_to_m3u_format(txt_content, group_title):
                 f'#EXTINF:-1 tvg-id="{name}" tvg-logo="{build_tvg_logo_url(name)}" group-title="{group_title}",{name}\n{url}'
             )
     return "\n".join(m3u_lines)
+
+
+def _build_readme_table_rows(repo_root: str, subdir: str, ext: str) -> str:
+    target_dir = os.path.join(repo_root, subdir)
+    if not os.path.exists(target_dir):
+        return '<tr><td colspan="4">暂无文件</td></tr>'
+    names = sorted([n for n in os.listdir(target_dir) if n.endswith(ext)])
+    if not names:
+        return '<tr><td colspan="4">暂无文件</td></tr>'
+
+    rows = []
+    for name in names:
+        file_path = os.path.join(target_dir, name)
+        encoded_name = quote(name)
+        raw_url = f"{RAW_BASE_URL}/{subdir}/{encoded_name}"
+        proxy_url = f"{PROXY_PREFIX}{raw_url}"
+        updated = datetime.fromtimestamp(os.path.getmtime(file_path)).strftime("%Y-%m-%d %H:%M:%S")
+        rows.append(
+            "<tr>"
+            f'<td style="white-space:nowrap;">{name}</td>'
+            f'<td style="white-space:nowrap;"><a href="{proxy_url}">下载链接</a></td>'
+            f'<td style="white-space:nowrap;">{updated}</td>'
+            f'<td><code>{proxy_url}</code></td>'
+            "</tr>"
+        )
+    return "\n".join(rows)
+
+
+def _build_readme_section_table(repo_root: str, subdir: str, ext: str) -> str:
+    rows = _build_readme_table_rows(repo_root, subdir, ext)
+    return (
+        '<table style="width:100%; table-layout:auto;">\n'
+        "<colgroup>\n"
+        '<col style="width: 220px;" />\n'
+        '<col style="width: 120px;" />\n'
+        '<col style="width: 170px;" />\n'
+        "<col />\n"
+        "</colgroup>\n"
+        "<thead>\n"
+        "<tr>\n"
+        '<th style="white-space:nowrap;">文件名</th>\n'
+        '<th style="white-space:nowrap;">加速链接</th>\n'
+        '<th style="white-space:nowrap;">最近更新时间</th>\n'
+        '<th style="white-space:nowrap;">可复制直链</th>\n'
+        "</tr>\n"
+        "</thead>\n"
+        "<tbody>\n"
+        f"{rows}\n"
+        "</tbody>\n"
+        "</table>"
+    )
+
+
+def update_readme_file_list(repo_root: str) -> None:
+    readme_path = os.path.join(repo_root, README_FILE)
+    if not os.path.exists(readme_path):
+        print("[-] README.md 不存在，跳过列表更新。")
+        return
+    with open(readme_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    m3u_table = _build_readme_section_table(repo_root, "m3u", ".m3u")
+    txt_table = _build_readme_section_table(repo_root, "txt", ".txt")
+    m3u_block = f"## M3U 文件列表\n\n{m3u_table}\n"
+    txt_block = f"## TXT 文件列表\n\n{txt_table}\n"
+
+    content, m3u_count = re.subn(
+        r"## M3U 文件列表[\s\S]*?(?=\n---\n\n## TXT 文件列表)",
+        m3u_block.rstrip(),
+        content,
+        count=1,
+    )
+    content, txt_count = re.subn(
+        r"## TXT 文件列表[\s\S]*$",
+        txt_block.rstrip(),
+        content,
+        count=1,
+    )
+
+    if m3u_count == 0 or txt_count == 0:
+        print("[-] README 结构不匹配（未找到列表区块），跳过自动更新。")
+        return
+
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print("[+] README.md 文件列表已自动更新。")
 
 def process_province(province, txt_output_dir, m3u_output_dir):
     """单一省份核心流水线"""
@@ -514,6 +645,8 @@ def main():
     generated_files.extend(
         [os.path.join("m3u", f) for f in os.listdir(m3u_output_dir) if f.endswith('.m3u')]
     )
+    update_readme_file_list(repo_root)
+    generated_files.append(README_FILE)
     if args.push:
         print("\n[] 流水线本地文件生成完毕，准备执行 GitHub 同步...")
         push_to_github(generated_files)
